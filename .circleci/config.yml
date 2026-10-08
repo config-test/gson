@@ -1,0 +1,250 @@
+version: 2.1
+
+# CircleCI translation of the existing GitHub Actions workflows in .github/workflows/.
+# Those workflows are the source of truth for what CI does here; commands below are copied
+# from them verbatim (no invented build/test/lint commands).
+#
+# Not translated (GitHub-platform specific, keep running on GitHub Actions):
+#   - codeql-analysis.yml  (github/codeql-action)
+#   - scorecard.yml        (ossf/scorecard-action + SARIF upload to GitHub code scanning)
+#   - cifuzz.yml           (google/oss-fuzz CIFuzz actions)
+
+# No orbs are used: everything needed is already in the base images.
+
+# ---------------------------------------------------------------------------
+# Shared anchors
+# ---------------------------------------------------------------------------
+
+# Mirrors `on: push: branches-ignore: [dependabot/**]` from the GitHub workflows.
+# CircleCI has no separate pull_request event, so ignoring the branch is the equivalent.
+ignore_dependabot: &ignore_dependabot
+  branches:
+    ignore:
+      - /dependabot\/.*/
+
+commands:
+  restore_maven_cache:
+    description: Restore the local Maven repository, keyed on the checksums of every pom.xml.
+    steps:
+      - restore_cache:
+          keys:
+            - maven-v1-{{ checksum "pom.xml" }}-{{ checksum "gson/pom.xml" }}-{{ checksum "extras/pom.xml" }}-{{ checksum "metrics/pom.xml" }}-{{ checksum "proto/pom.xml" }}-{{ checksum "test-graal-native-image/pom.xml" }}-{{ checksum "test-jpms/pom.xml" }}-{{ checksum "test-shrinker/pom.xml" }}
+            - maven-v1-{{ checksum "pom.xml" }}-
+            - maven-v1-
+
+  save_maven_cache:
+    description: Save the local Maven repository.
+    steps:
+      - save_cache:
+          key: maven-v1-{{ checksum "pom.xml" }}-{{ checksum "gson/pom.xml" }}-{{ checksum "extras/pom.xml" }}-{{ checksum "metrics/pom.xml" }}-{{ checksum "proto/pom.xml" }}-{{ checksum "test-graal-native-image/pom.xml" }}-{{ checksum "test-jpms/pom.xml" }}-{{ checksum "test-shrinker/pom.xml" }}
+          paths:
+            - ~/.m2/repository
+
+  collect_test_results:
+    description: Gather Surefire/Failsafe XML reports from every module for store_test_results.
+    steps:
+      - run:
+          name: Collect test results
+          when: always
+          command: |
+            mkdir -p ~/test-results/junit
+            find . -type f -path '*/target/*-reports/*.xml' -exec cp {} ~/test-results/junit/ \; || true
+      - store_test_results:
+          path: ~/test-results
+      - store_artifacts:
+          path: ~/test-results/junit
+          destination: test-reports
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+
+jobs:
+  # Mirrors the `build` job (matrix over JDK 11/17/21/25) of .github/workflows/build.yml
+  build:
+    parameters:
+      jdk:
+        type: string
+      extra_mvn_args:
+        type: string
+        default: ""
+    docker:
+      - image: cimg/openjdk:<< parameters.jdk >>
+    environment:
+      # Common Maven arguments, same as the `MAVEN_ARGS` env of the GitHub workflows
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Build with Maven
+          # This also runs javadoc:jar to detect any issues with the Javadoc generated during release
+          command: mvn verify javadoc:jar << parameters.extra_mvn_args >>
+      - collect_test_results
+      - save_maven_cache
+
+  # Mirrors the `build-gson-subset` job of .github/workflows/build.yml
+  build-gson-subset:
+    docker:
+      - image: cimg/openjdk:21.0
+    environment:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Build with Maven
+          command: mvn clean test --projects gson --activate-profiles gson-subset
+      - collect_test_results
+      - save_maven_cache
+
+  # Mirrors the `native-image-test` job of .github/workflows/build.yml
+  # NOTE: there is no CircleCI equivalent of graalvm/setup-graalvm, so this uses the
+  # GraalVM community container image directly and installs git/maven into it.
+  native-image-test:
+    parameters:
+      jdk:
+        type: string
+    docker:
+      - image: ghcr.io/graalvm/graalvm-community:<< parameters.jdk >>
+    environment:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - run:
+          name: Install git and Maven (required by checkout and the build)
+          command: microdnf install -y git maven tar gzip
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Build and run tests
+          # Only run tests in `test-graal-native-image` (and implicitly build and run tests in `gson`),
+          # everything else is covered already by regular build job above
+          command: mvn test --activate-profiles native-image-test --projects test-graal-native-image --also-make
+      - collect_test_results
+      - save_maven_cache
+
+  # Mirrors the `verify-reproducible-build` job of .github/workflows/build.yml
+  verify-reproducible-build:
+    docker:
+      - image: cimg/openjdk:17.0
+    environment:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Verify no plugin issues
+          command: mvn artifact:check-buildplan --projects '!metrics,!test-graal-native-image,!test-jpms,!test-shrinker'
+      - run:
+          name: Verify reproducible build
+          # See https://maven.apache.org/guides/mini/guide-reproducible-builds.html#how-to-test-my-maven-build-reproducibility
+          command: |
+            mvn clean install -Dmaven.test.skip --projects '!metrics,!test-graal-native-image,!test-jpms,!test-shrinker'
+            # Run with `-Dbuildinfo.attach=false`; otherwise `artifact:compare` fails because it creates a `.buildinfo` file which
+            # erroneously references the existing `.buildinfo` file (respectively because it is overwriting it, a file with size 0)
+            # See https://issues.apache.org/jira/browse/MARTIFACT-57
+            mvn clean verify artifact:compare -Dmaven.test.skip --projects '!metrics,!test-graal-native-image,!test-jpms,!test-shrinker' -Dbuildinfo.attach=false
+      - save_maven_cache
+
+  # Mirrors .github/workflows/check-android-compatibility.yml
+  check-android-compatibility:
+    docker:
+      - image: cimg/openjdk:17.0
+    environment:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Check Android compatibility
+          command: mvn compile animal-sniffer:check@check-android-compatibility -Dmaven.test.skip --projects '!metrics,!proto,!test-graal-native-image,!test-jpms,!test-shrinker'
+      - save_maven_cache
+
+  # Mirrors .github/workflows/check-api-compatibility.yml (GitHub: `on: pull_request`).
+  # CircleCI has no pull_request-only trigger, so the job self-skips when the build is
+  # not for a pull request, and derives the base commit with `git merge-base` instead of
+  # using ${{ github.event.pull_request.base.sha }}.
+  check-api-compatibility:
+    docker:
+      - image: cimg/openjdk:17.0
+    environment:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+      # Branch the pull request targets; used to determine the "old" version to compare against.
+      API_COMPAT_BASE_BRANCH: main
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Build old version
+          command: |
+            if [ -z "$CIRCLE_PULL_REQUEST" ]; then
+              echo "Not a pull request build - skipping API compatibility check."
+              circleci-agent step halt
+            fi
+            git fetch --no-tags origin "$API_COMPAT_BASE_BRANCH"
+            BASE_SHA=$(git merge-base HEAD "origin/$API_COMPAT_BASE_BRANCH")
+            echo "Comparing against base commit $BASE_SHA"
+            git worktree add ../gson-old-japicmp "$BASE_SHA"
+            cd ../gson-old-japicmp
+            # Set dummy version
+            mvn org.codehaus.mojo:versions-maven-plugin:2.16.2:set "-DnewVersion=0.0.0-JAPICMP-OLD"
+            # Install artifacts with dummy version in local repository; used later by Maven plugin for comparison
+            mvn install -Dmaven.test.skip --projects '!metrics,!test-graal-native-image,!test-jpms,!test-shrinker'
+      - run:
+          name: Check API compatibility
+          command: mvn package japicmp:cmp --fail-at-end -Dmaven.test.skip --projects '!extras,!metrics,!test-graal-native-image,!test-jpms,!test-shrinker'
+      - run:
+          name: Collect API differences
+          when: always
+          command: |
+            mkdir -p ~/api-differences
+            find . -type f -path '*/japicmp/default-cli.*' -exec cp {} ~/api-differences/ \; || true
+      # Mirrors the `api-differences` upload-artifact step
+      - store_artifacts:
+          path: ~/api-differences
+          destination: api-differences
+      - save_maven_cache
+
+# ---------------------------------------------------------------------------
+# Workflows - all jobs run in parallel
+# ---------------------------------------------------------------------------
+
+workflows:
+  build:
+    jobs:
+      - build:
+          name: build-jdk-<< matrix.jdk >>
+          matrix:
+            parameters:
+              jdk: ["17.0", "21.0", "25.0"]
+          filters: *ignore_dependabot
+
+      # Custom JDK 11 configuration because some of the plugins and test dependencies don't
+      # support it anymore, but it is important to still test with a JDK version without Record classes.
+      # Disable Enforcer check which (intentionally) prevents using JDK 11 for building.
+      # Exclude 'test-graal-native-image' module because JUnit 6 requires >= Java 17.
+      # Exclude 'proto' module because protobuf-maven-plugin requires >= Java 17.
+      - build:
+          name: build-jdk-11
+          jdk: "11.0"
+          extra_mvn_args: -Denforcer.fail=false --projects '!test-graal-native-image,!proto'
+          filters: *ignore_dependabot
+
+      - build-gson-subset:
+          filters: *ignore_dependabot
+
+      - native-image-test:
+          name: native-image-test-jdk-<< matrix.jdk >>
+          matrix:
+            parameters:
+              jdk: ["21", "25"]
+          filters: *ignore_dependabot
+
+      - verify-reproducible-build:
+          filters: *ignore_dependabot
+
+      - check-android-compatibility:
+          filters: *ignore_dependabot
+
+      - check-api-compatibility:
+          filters: *ignore_dependabot
