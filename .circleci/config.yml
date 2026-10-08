@@ -1,0 +1,45 @@
+version: 2.1
+
+jobs:
+  build:
+    docker:
+      - image: cimg/openjdk:21.0
+    environment:
+      # Keep Maven output readable in CI logs
+      MAVEN_CLI_OPTS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - checkout
+
+      # Maven has no lockfile, so key the cache on the contents of every pom.xml
+      # in the reactor instead.
+      - run:
+          name: Build dependency cache key
+          command: |
+            find . -name pom.xml -not -path './*/target/*' | sort | xargs sha256sum > .maven-cache-key
+            cat .maven-cache-key
+
+      - restore_cache:
+          keys:
+            - gson-maven-v1-{{ checksum ".maven-cache-key" }}
+            - gson-maven-v1-
+
+      # Warms ~/.m2 so the build step mostly compiles instead of downloading.
+      # Non-fatal: `go-offline` is unreliable for multi-module reactors, and any
+      # dependency it misses is resolved again by the build step below.
+      - run:
+          name: Resolve dependencies
+          command: mvn $MAVEN_CLI_OPTS dependency:go-offline || true
+
+      - run:
+          name: Build and test
+          command: mvn $MAVEN_CLI_OPTS verify
+
+      - save_cache:
+          key: gson-maven-v1-{{ checksum ".maven-cache-key" }}
+          paths:
+            - ~/.m2/repository
+
+workflows:
+  build:
+    jobs:
+      - build
