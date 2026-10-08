@@ -1,0 +1,71 @@
+version: 2.1
+
+# Gson is a single Maven reactor (root `pom.xml` with the `gson`, `extras`, `metrics`,
+# `proto`, `test-jpms`, `test-graal-native-image` and `test-shrinker` modules). The
+# existing GitHub Actions `Build` workflow drives everything from the repo root with a
+# single `mvn verify`, so there is one job here rather than one per module.
+
+jobs:
+  gson:
+    docker:
+      # JDK 21: the root `pom.xml` enforcer requires `[17,26)` and the GitHub workflow
+      # builds on 17/21/25. 21 is the newest version that ships jmod files by default,
+      # which the ProGuard tests in `test-shrinker` need.
+      - image: cimg/openjdk:21.0
+    environment:
+      # Same Maven arguments the GitHub workflow uses.
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - checkout
+
+      # Maven has no lockfile, so key the cache on the contents of every `pom.xml`.
+      # `checksum` only accepts one file, hence the concatenation.
+      - run:
+          name: Collect POMs for cache key
+          command: |
+            find . -name pom.xml -not -path '*/target/*' | sort | xargs cat > /tmp/maven-poms.txt
+
+      - restore_cache:
+          keys:
+            - gson-maven-v1-{{ checksum "/tmp/maven-poms.txt" }}
+            - gson-maven-v1-
+
+      # Compiles all modules and installs them into `~/.m2`, which is also what
+      # populates the dependency cache. Maven has no install step separate from the
+      # build, so this single step covers both.
+      - run:
+          name: Build (compile and install modules, skipping tests)
+          command: mvn $MAVEN_ARGS -DskipTests -Dspotless.check.skip=true install
+
+      - save_cache:
+          key: gson-maven-v1-{{ checksum "/tmp/maven-poms.txt" }}
+          paths:
+            - ~/.m2/repository
+
+      # `javadoc:jar` matches the GitHub workflow: it catches Javadoc problems that
+      # would otherwise only show up at release time.
+      - run:
+          name: Test
+          command: mvn $MAVEN_ARGS -Dspotless.check.skip=true verify javadoc:jar
+
+      # Spotless (google-java-format) is the project's formatter/linter. Run
+      # `mvn spotless:apply` locally to fix violations.
+      - run:
+          name: Lint (Spotless)
+          command: mvn $MAVEN_ARGS spotless:check
+
+      # `store_test_results` takes a single directory, so gather every module's
+      # surefire reports under one path first.
+      - run:
+          name: Collect test results
+          when: always
+          command: |
+            mkdir -p /tmp/test-results
+            find . -path '*/target/surefire-reports/*.xml' -exec cp {} /tmp/test-results/ \;
+      - store_test_results:
+          path: /tmp/test-results
+
+workflows:
+  build:
+    jobs:
+      - gson
