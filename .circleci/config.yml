@@ -1,0 +1,95 @@
+version: 2.1
+
+executors:
+  java:
+    docker:
+      # Existing CI uses JDK 21; the README recommends it for a full test run.
+      - image: cimg/openjdk:21.0
+    environment:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+
+commands:
+  check-module:
+    parameters:
+      module:
+        type: string
+      has-tests:
+        type: boolean
+        default: true
+    steps:
+      - checkout
+      # Maven has no lockfile here. Include the parent, module and Gson dependency POMs.
+      - restore_cache:
+          keys:
+            - 'v1-maven-21-<< parameters.module >>-{{ checksum "pom.xml" }}-{{ checksum "gson/pom.xml" }}-{{ checksum "<< parameters.module >>/pom.xml" }}'
+      - run:
+          name: Install module and reactor dependencies
+          command: mvn install --projects << parameters.module >> --also-make -Dmaven.test.skip=true
+      - save_cache:
+          key: 'v1-maven-21-<< parameters.module >>-{{ checksum "pom.xml" }}-{{ checksum "gson/pom.xml" }}-{{ checksum "<< parameters.module >>/pom.xml" }}'
+          paths:
+            - ~/.m2/repository
+      - run:
+          name: Build
+          command: mvn package --projects << parameters.module >> --also-make -Dmaven.test.skip=true
+      - when:
+          condition: << parameters.has-tests >>
+          steps:
+            - run:
+                # verify also runs Failsafe integration tests and packaging tools.
+                name: Test and verify Javadoc (existing CI command)
+                command: mvn verify javadoc:jar --projects << parameters.module >> --also-make
+      - run:
+          name: Check formatting with Spotless
+          command: mvn spotless:check --projects << parameters.module >> --also-make
+
+jobs:
+  gson:
+    executor: java
+    steps:
+      - check-module:
+          module: gson
+  extras:
+    executor: java
+    steps:
+      - check-module:
+          module: extras
+  proto:
+    executor: java
+    steps:
+      - check-module:
+          module: proto
+  metrics:
+    executor: java
+    steps:
+      # Benchmark sources only; no test suite is defined in this module.
+      - check-module:
+          module: metrics
+          has-tests: false
+  test-jpms:
+    executor: java
+    steps:
+      - check-module:
+          module: test-jpms
+  test-graal-native-image:
+    executor: java
+    steps:
+      # The default JVM tests work on OpenJDK; the opt-in native profile needs GraalVM.
+      - check-module:
+          module: test-graal-native-image
+  test-shrinker:
+    executor: java
+    steps:
+      - check-module:
+          module: test-shrinker
+
+workflows:
+  build-test-lint:
+    jobs:
+      - gson
+      - extras
+      - proto
+      - metrics
+      - test-jpms
+      - test-graal-native-image
+      - test-shrinker
