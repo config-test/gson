@@ -1,0 +1,41 @@
+# CircleCI starter config for the Gson Maven multi-module project.
+# Modules under gson/, extras/, metrics/, proto/, and test-* are built/tested
+# together via the root reactor (same as .github/workflows/build.yml).
+version: 2.1
+
+jobs:
+  build-and-test:
+    docker:
+      # Newest JDK allowed by maven-enforcer ([17,26)); existing CI also builds on 25.
+      - image: cimg/openjdk:25.0
+    environment:
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            # No lockfile; cache key derived from the parent POM (dependency versions live here).
+            - maven-v1-{{ checksum "pom.xml" }}
+            - maven-v1-
+      - run:
+          name: Install dependencies
+          command: mvn $MAVEN_ARGS dependency:go-offline
+      - save_cache:
+          key: maven-v1-{{ checksum "pom.xml" }}
+          paths:
+            - ~/.m2/repository
+      - run:
+          name: Build
+          command: mvn $MAVEN_ARGS package -DskipTests
+      - run:
+          name: Test
+          command: mvn $MAVEN_ARGS test
+      - run:
+          name: Lint
+          # Documented in .github/pull_request_template.md; also runs during verify.
+          command: mvn $MAVEN_ARGS spotless:check
+
+workflows:
+  build:
+    jobs:
+      - build-and-test
