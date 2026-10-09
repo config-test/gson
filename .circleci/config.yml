@@ -1,0 +1,88 @@
+version: 2.1
+
+jobs:
+  gson: &java-module
+    docker:
+      # JDK 21 is used by existing CI; Maven is included in this image.
+      - image: cimg/openjdk:21.0
+    environment:
+      PROJECT: gson
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+    steps:
+      - checkout
+      # Maven has no lockfile here. Include every reactor POM in the cache key.
+      - run:
+          name: Calculate Maven cache checksum
+          command: |
+            sha256sum pom.xml gson/pom.xml extras/pom.xml metrics/pom.xml \
+              proto/pom.xml test-jpms/pom.xml test-shrinker/pom.xml \
+              test-graal-native-image/pom.xml > /tmp/gson-maven-cache-key
+      - restore_cache:
+          keys:
+            - maven-v1-jdk21-{{ checksum "/tmp/gson-maven-cache-key" }}
+            - maven-v1-jdk21-
+      - run:
+          name: Install reactor dependencies
+          command: |
+            # Every other module depends on the local Gson snapshot and parent POM.
+            # Install them before resolving the selected module's dependencies.
+            mvn install -Dmaven.test.skip --projects gson --also-make
+            mvn dependency:resolve --projects "$PROJECT"
+      - save_cache:
+          key: maven-v1-jdk21-{{ checksum "/tmp/gson-maven-cache-key" }}
+          paths:
+            - ~/.m2/repository
+      - run:
+          name: Build, test and lint
+          # Existing CI command, scoped to this module. verify includes packaging,
+          # Surefire tests, any Failsafe integration tests, and Spotless checks.
+          # metrics has no tests; Maven simply builds and checks that module.
+          # Native-image tests use the regular JVM here, as in the standard CI job.
+          command: mvn verify javadoc:jar --projects "$PROJECT"
+
+  extras:
+    <<: *java-module
+    environment:
+      PROJECT: extras
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+
+  metrics:
+    <<: *java-module
+    environment:
+      PROJECT: metrics
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+
+  proto:
+    <<: *java-module
+    environment:
+      PROJECT: proto
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+
+  test-jpms:
+    <<: *java-module
+    environment:
+      PROJECT: test-jpms
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+
+  test-shrinker:
+    <<: *java-module
+    environment:
+      PROJECT: test-shrinker
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+
+  test-graal-native-image:
+    <<: *java-module
+    environment:
+      PROJECT: test-graal-native-image
+      MAVEN_ARGS: --show-version --batch-mode --no-transfer-progress
+
+workflows:
+  build:
+    jobs:
+      - gson
+      - extras
+      - metrics
+      - proto
+      - test-jpms
+      - test-shrinker
+      - test-graal-native-image
