@@ -1,0 +1,47 @@
+# CircleCI starter config for google/gson (Java / Maven multi-module).
+# One project: the root Maven reactor (existing CI runs `mvn verify javadoc:jar` from the root).
+version: 2.1
+
+jobs:
+  build:
+    docker:
+      - image: cimg/openjdk:25.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            # No Maven lockfile; cache key is based on the root POM.
+            - maven-{{ checksum "pom.xml" }}
+            - maven-
+      - run:
+          name: Install dependencies
+          command: >
+            mvn --show-version --batch-mode --no-transfer-progress
+            dependency:go-offline
+      - save_cache:
+          key: maven-{{ checksum "pom.xml" }}
+          paths:
+            - ~/.m2
+      - run:
+          name: Build
+          # Mirrors GitHub Actions `build.yml`: package + javadoc:jar (tests run in the next step).
+          command: >
+            mvn --show-version --batch-mode --no-transfer-progress
+            package -DskipTests javadoc:jar
+      - run:
+          name: Test
+          # Same verify lifecycle as existing CI (Surefire + Failsafe).
+          command: >
+            mvn --show-version --batch-mode --no-transfer-progress
+            verify
+      - run:
+          name: Lint
+          # Spotless (google-java-format); also documented in the PR template.
+          command: >
+            mvn --show-version --batch-mode --no-transfer-progress
+            spotless:check
+
+workflows:
+  build:
+    jobs:
+      - build
